@@ -98,6 +98,8 @@
   .waste-note b{color:var(--ink);font-weight:700}
   .waste-note.hi b{color:var(--bad)}
   .waste-note.lo b{color:var(--accent)}
+  .autonest-tog{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted);margin-left:10px;cursor:pointer;user-select:none}
+  .autonest-tog input{accent-color:var(--accent)}
   .zoom-readout{font-size:11px;color:var(--faint);font-family:'IBM Plex Mono',monospace;min-width:42px;text-align:center}
   .canvas-wrap{flex:1;overflow:auto;position:relative;padding:40px}
   .preview-list{display:flex;flex-direction:row;gap:34px;align-items:flex-start;width:max-content;margin:0 auto;min-width:100%;min-height:100%}
@@ -268,7 +270,12 @@
             <option value="5">Free — any angle</option>
           </select>
         </div>
-        <label class="chk" style="margin-bottom:11px"><input type="checkbox" id="optInterlock" checked> True-shape interlock</label>
+        <label class="chk" style="margin-bottom:8px"><input type="checkbox" id="optInterlock" checked> True-shape interlock</label>
+        <div id="aggrWrap" class="field" style="margin:-2px 0 11px">
+          <label id="lblAggr" style="display:flex;justify-content:space-between">Interlock tightness <span id="aggrVal" style="color:var(--accent)">100%</span></label>
+          <input type="range" id="optAggr" min="0" max="100" value="100" step="5" style="width:100%;accent-color:var(--accent)">
+          <div style="display:flex;justify-content:space-between;font-size:10.5px;color:var(--muted);margin-top:2px"><span>Box</span><span>Artwork</span></div>
+        </div>
         <label class="chk" style="margin-bottom:11px"><input type="checkbox" id="optAutoGap" checked> Auto-expand gap</label>
         <div class="field" style="margin-bottom:0"><label id="lblGap">Gap between art (in) — minimum</label><input type="number" id="gapIn" value="0.125" min="0" step="0.025"></div>
         <div class="mini">Gap is the guaranteed minimum space between any artwork. With auto-expand on, it grows larger when there's room without losing images or adding sheets.</div>
@@ -296,6 +303,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="14" width="7" height="7"/></svg>
           Auto-nest
         </button>
+        <label class="autonest-tog" id="autoNestTog" title="When on, the layout re-nests whenever you change a setting. Turn off to keep manual edits."><input type="checkbox" id="autoNestChk" checked> auto</label>
         <span class="waste-note" id="wasteNote" title="Empty space inside the printed area — lower is a tighter nest"></span>
         <div style="flex:1"></div>
         <button class="tool" id="zoomOut"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M8 11h6M21 21l-4.35-4.35"/></svg></button>
@@ -472,6 +480,8 @@ const S = {
   effGapIn:0.125,      // gap actually used after auto-expand
   totalNeededIn:0,     // single-sheet length for required art
   sheetLens:[],        // per-sheet output length: [{mode:'max'|'fit'|'custom', custom:inches}]
+  autoNest:true,       // re-nest automatically when settings change (off = keep manual layout)
+  interlockAggr:1,     // interlock tightness: 1 = tight artwork, 0 = bounding box
 };
 const LOWRES=150, OKRES=250;
 const CM=2.54;
@@ -528,6 +538,10 @@ $('unitCm').addEventListener('click',()=>applyUnit('cm'));
 $('widthSel').addEventListener('change',e=>{ $('customWrap').style.display=e.target.value==='custom'?'block':'none'; if(e.target.value==='custom')$('widthCustom').value=+toU(S.widthIn).toFixed(2); readConfig(); scheduleNest(); });
 ['widthCustom','maxLen','dpiSel','gapIn'].forEach(id=>$(id).addEventListener('input',()=>{ readConfig(); scheduleNest(); }));
 ['optInterlock','optStep','optAutoGap'].forEach(id=>$(id).addEventListener('input',scheduleNest));
+function syncAggrUI(){ const on=$('optInterlock').checked; $('aggrWrap').style.opacity=on?'1':'.4'; $('optAggr').disabled=!on; $('aggrVal').textContent=$('optAggr').value+'%'; }
+$('optAggr').addEventListener('input',()=>{ S.interlockAggr=(+$('optAggr').value)/100; $('aggrVal').textContent=$('optAggr').value+'%'; scheduleNest(); });
+$('optInterlock').addEventListener('change',syncAggrUI);
+syncAggrUI();
 $('optRotate').addEventListener('input',()=>{ $('rotStepWrap').style.display=$('optRotate').checked?'block':'none'; scheduleNest(); });
 
 /* ---------- upload ---------- */
@@ -657,11 +671,10 @@ function trimTransparent(img){
 /* ---------- nesting ---------- */
 function nestCpi(gap){
   const g = gap==null ? S.gapIn : gap;
-  let cpi=6;
-  if(g>0) cpi=Math.ceil(2/g);          // resolve the gap with ~2 cells
-  cpi=Math.min(16,Math.max(5,cpi));
+  let cpi = g>0 ? Math.ceil(2.2/g) : 10;   // ~2 cells across the gap; higher res for small gaps
+  cpi = Math.min(22, Math.max(8, cpi));
   if(S.widthIn*cpi>700) cpi=Math.floor(700/S.widthIn);
-  return Math.max(4,cpi);
+  return Math.max(6,cpi);
 }
 function buildAngles(){
   if(!$('optRotate').checked) return [0];
@@ -677,21 +690,47 @@ function dilateMask(src,w,h,r){
   }
   return out;
 }
-function buildFootprint(d,angleDeg,cpi,trueShape,gapCells){
+function distTransform(core,w,h){    // chamfer distance (in cells) to nearest artwork cell
+  const INF=1e9, d=new Float32Array(w*h);
+  for(let i=0;i<w*h;i++) d[i]=core[i]?0:INF;
+  const a=1, b=1.4142;
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){ const i=y*w+x; let v=d[i];
+    if(x>0)v=Math.min(v,d[i-1]+a); if(y>0)v=Math.min(v,d[i-w]+a);
+    if(x>0&&y>0)v=Math.min(v,d[i-w-1]+b); if(x<w-1&&y>0)v=Math.min(v,d[i-w+1]+b); d[i]=v; }
+  for(let y=h-1;y>=0;y--)for(let x=w-1;x>=0;x--){ const i=y*w+x; let v=d[i];
+    if(x<w-1)v=Math.min(v,d[i+1]+a); if(y<h-1)v=Math.min(v,d[i+w]+a);
+    if(x<w-1&&y<h-1)v=Math.min(v,d[i+w+1]+b); if(x>0&&y<h-1)v=Math.min(v,d[i+w-1]+b); d[i]=v; }
+  return d;
+}
+// aggr: 1 = tight true-shape, 0 = full bounding box, in between = artwork inflated toward the box
+function buildFootprint(d,angleDeg,cpi,aggr,gapCells){
   const a=angleDeg*Math.PI/180;
   const wC=d.wIn*cpi, hC=d.hIn*cpi;
   const c=Math.abs(Math.cos(a)), s=Math.abs(Math.sin(a));
   const baseW=Math.max(1,Math.ceil(wC*c+hC*s)), baseH=Math.max(1,Math.ceil(wC*s+hC*c));
-  const pad=gapCells;                              // reserve gap on every side (fixes horizontal gap)
+  const pad=gapCells;
   const bw=baseW+pad*2, bh=baseH+pad*2;
   const cv=document.createElement('canvas');cv.width=bw;cv.height=bh;
   const ctx=cv.getContext('2d');
-  ctx.save();ctx.translate(bw/2,bh/2);ctx.rotate(a);
-  if(trueShape) ctx.drawImage(d.img,-wC/2,-hC/2,wC,hC); else {ctx.fillStyle='#000';ctx.fillRect(-wC/2,-hC/2,wC,hC);}
-  ctx.restore();
-  const data=ctx.getImageData(0,0,bw,bh).data;
-  const core=new Uint8Array(bw*bh);
-  for(let i=0;i<bw*bh;i++) core[i]=data[i*4+3]>20?1:0;
+  // box mask = the image's rectangle (rotated)
+  ctx.save();ctx.translate(bw/2,bh/2);ctx.rotate(a);ctx.fillStyle='#000';ctx.fillRect(-wC/2,-hC/2,wC,hC);ctx.restore();
+  const boxData=ctx.getImageData(0,0,bw,bh).data; const boxCore=new Uint8Array(bw*bh);
+  for(let i=0;i<bw*bh;i++) boxCore[i]=boxData[i*4+3]>20?1:0;
+  let core;
+  if(aggr<=0.001){ core=boxCore; }                       // pure box
+  else {
+    ensureMask(d);                                        // artwork mask (rotated)
+    ctx.clearRect(0,0,bw,bh);
+    ctx.save();ctx.translate(bw/2,bh/2);ctx.rotate(a);ctx.drawImage(d._maskCanvas,-wC/2,-hC/2,wC,hC);ctx.restore();
+    const artData=ctx.getImageData(0,0,bw,bh).data; const artCore=new Uint8Array(bw*bh);
+    for(let i=0;i<bw*bh;i++) artCore[i]=artData[i*4+3]>20?1:0;
+    if(aggr>=0.999){ core=artCore; }                      // pure artwork
+    else {                                                // inflate artwork toward the box
+      const dist=distTransform(artCore,bw,bh), r=(1-aggr)*Math.hypot(baseW,baseH);
+      core=new Uint8Array(bw*bh);
+      for(let i=0;i<bw*bh;i++) core[i]=(boxCore[i] && dist[i]<=r)?1:0;
+    }
+  }
   const mask=dilateMask(core,bw,bh,gapCells);
   const top=new Int32Array(bw).fill(-1), bot=new Int32Array(bw).fill(-1);
   for(let x=0;x<bw;x++)for(let y=0;y<bh;y++){ if(mask[y*bw+x]){ if(top[x]<0)top[x]=y; bot[x]=y+1; } }
@@ -727,6 +766,7 @@ function nestAll(){
   S.sheets=[]; S.effGapIn=S.gapIn;
   if(!S.designs.length){ S.totalNeededIn=0; updateLenNote(); renderPreview(); return; }
   const interlock=$('optInterlock').checked, minLen=true;
+  const packAggr = interlock ? (S.interlockAggr==null?1:S.interlockAggr) : 0;
   const autoGap=$('optAutoGap').checked;
   const angleList=buildAngles();
   const minGap=S.gapIn;
@@ -739,13 +779,13 @@ function nestAll(){
 
   const fpCache=new Map();
   // pack required pieces AND run auto-fill at a given gap; returns the full layout + total image count
-  function packFull(gapIn, fill=true, capIn=capLen){
+  function packFull(gapIn, fill=true, capIn=capLen, pocket=false){
     const cpi=nestCpi(gapIn), W=Math.max(1,Math.round(S.widthIn*cpi));
-    const gapCells=Math.max(gapIn>0?1:0, Math.round(gapIn*cpi/2));
+    const gapCells=Math.max(0, Math.round(gapIn*cpi/2));
     const maxLenCells=Math.round(capIn*cpi);
     const ROT_EPS=Math.max(2, Math.round(0.25*cpi));
-    const fpsFor=(d,ts)=>{ const k=d.id+'|'+ts+'|'+cpi+'|'+gapCells; let v=fpCache.get(k); if(v)return v;
-      v=angleList.map(ang=>({ang,fp:buildFootprint(d,ang,cpi,ts,gapCells)})); fpCache.set(k,v); return v; };
+    const fpsFor=(d,aggr)=>{ const k=d.id+'|'+aggr+'|'+cpi+'|'+gapCells; let v=fpCache.get(k); if(v)return v;
+      v=angleList.map(ang=>({ang,fp:buildFootprint(d,ang,cpi,aggr,gapCells)})); fpCache.set(k,v); return v; };
     const pickBest=(cand,surface,ts,cap)=>{ let b=null,ba=0,bm=Infinity;
       for(const {ang,fp} of cand){ const r=findPlacement([fp],surface,W,minLen,ts,cap); if(!r) continue;
         let m = ts ? r.score : (minLen?r.bottom:r.py);
@@ -756,21 +796,70 @@ function nestAll(){
       const cxIn=(x+fp.bw/2)/cpi, cyIn=(py+fp.bh/2)/cpi;
       sheet.placements.push({d, xIn:cxIn-d.wIn/2, yIn:cyIn-d.hIn/2, rot:ang}); };
     const newSheetIn=(arr)=>{ const s={surface:new Int32Array(W).fill(0),placements:[]}; arr.push(s); return s; };
-    const packMode=(ts)=>{ const sheets=[];
-      for(const d of inst){ const cand=fpsFor(d,ts); let best=null,bestAng=0,target=null;
+    const packMode=(aggrVal)=>{ const ts=aggrVal>0; const sheets=[];
+      for(const d of inst){ const cand=fpsFor(d,aggrVal); let best=null,bestAng=0,target=null;
         for(const cs of sheets){ const res=pickBest(cand,cs.surface,ts,maxLenCells); if(res.b){best=res.b;bestAng=res.ba;target=cs;break;} }
-        if(!target){ target=newSheetIn(sheets); const res=pickBest(cand,target.surface,ts,Infinity); best=res.b; bestAng=res.ba; }  // fresh sheet: place even if taller than max
+        if(!target){ target=newSheetIn(sheets); const res=pickBest(cand,target.surface,ts,Infinity); best=res.b; bestAng=res.ba; }
         if(!best) continue; commit(best,bestAng,target,d); }
       return sheets; };
     const totLen=(sheets)=>{ let t=0; sheets.forEach(s=>{ let mb=0; for(let i=0;i<W;i++) if(s.surface[i]>mb) mb=s.surface[i]; t+=mb; }); return t; };
-    // required pass — use true-shape interlock ONLY when it strictly wins (fewer sheets, or
-    // same sheets and shorter). Otherwise fall back to rectangles, so interlock can never
-    // make the gang sheet longer than plain packing would.
-    let sheets, usedTS=false;
-    if(interlock){ const A=packMode(true), B=packMode(false);
-      if(A.length<B.length || (A.length===B.length && totLen(A)<totLen(B))){ sheets=A; usedTS=true; }
-      else { sheets=B; usedTS=false; }
-    } else { sheets=packMode(false); usedTS=false; }
+    // required pass — use interlock (at the chosen tightness) ONLY when it strictly wins; otherwise
+    // fall back to boxes, so interlock can never make the gang sheet longer than plain packing would.
+    let sheets, usedAggr=0;
+    if(interlock && packAggr>0){ const A=packMode(packAggr), B=packMode(0);
+      if(A.length<B.length || (A.length===B.length && totLen(A)<totLen(B))){ sheets=A; usedAggr=packAggr; }
+      else { sheets=B; usedAggr=0; }
+    } else { sheets=packMode(0); usedAggr=0; }
+    // ---- shared 2D free-space helpers (true-shape occupancy) ----
+    const occH=maxLenCells;
+    const orthA=angleList.filter(a=>(((a%90)+90)%90)===0); const pAng=orthA.length?orthA:[0];
+    const fpTrue=(d)=>fpsFor(d,usedAggr);
+    const buildOcc=(s)=>{ const occ=new Uint8Array(W*occH);
+      s.placements.forEach(p=>{ const cand=fpTrue(p.d); const fe=cand.find(c=>c.ang===p.rot)||cand[0]; const fp=fe.fp;
+        const cxC=(p.xIn+p.d.wIn/2)*cpi, cyC=(p.yIn+p.d.hIn/2)*cpi;
+        const x0=Math.round(cxC-fp.bw/2), y0=Math.round(cyC-fp.bh/2);
+        for(let col=0;col<fp.bw;col++){ if(fp.top[col]<0)continue; const gx=x0+col; if(gx<0||gx>=W)continue;
+          let ya=y0+fp.top[col], yb=y0+fp.bot[col]; if(ya<0)ya=0; if(yb>occH)yb=occH; for(let yy=ya;yy<yb;yy++) occ[yy*W+gx]=1; } });
+      return occ; };
+    const fits=(occ,fp,x0,y0)=>{ for(let col=0;col<fp.bw;col++){ if(fp.top[col]<0)continue; const gx=x0+col; if(gx<0||gx>=W)return false;
+        const ya=y0+fp.top[col], yb=y0+fp.bot[col]; if(ya<0||yb>occH)return false;
+        for(let yy=ya;yy<yb;yy++) if(occ[yy*W+gx])return false; } return true; };
+    const mark=(occ,fp,x0,y0)=>{ for(let col=0;col<fp.bw;col++){ if(fp.top[col]<0)continue; const gx=x0+col; if(gx<0||gx>=W)continue;
+        const ya=Math.max(0,y0+fp.top[col]), yb=Math.min(occH,y0+fp.bot[col]); for(let yy=ya;yy<yb;yy++) occ[yy*W+gx]=1; } };
+    const findSpot=(occ,cand)=>{ const step=Math.max(1,Math.round(0.1*cpi));
+      for(const {ang,fp} of cand){ const pad=fp.pad||0;
+        for(let y0=0; y0+fp.bh<=occH; y0+=step){ for(let x0=-pad; x0<=W-fp.bw+pad; x0+=step){ if(fits(occ,fp,x0,y0)) return {ang,fp,x0,y0}; } } }
+      return null; };
+    const placeSpot=(s,occ,d,spot)=>{ const {ang,fp,x0,y0}=spot; mark(occ,fp,x0,y0);
+      const cxIn=(x0+fp.bw/2)/cpi, cyIn=(y0+fp.bh/2)/cpi;
+      s.placements.push({d, xIn:cxIn-d.wIn/2, yIn:cyIn-d.hIn/2, rot:ang});
+      for(let col=0;col<fp.bw;col++){ if(fp.bot[col]<0)continue; const gx=x0+col; if(gx<0||gx>=W)continue; const nb=y0+fp.bot[col]; if(nb>s.surface[gx]) s.surface[gx]=nb; } };
+
+    // CONSOLIDATE (final layout): if the job spans >1 sheet, try to re-pack everything into
+    // fewer sheets with the 2D true-shape packer. Only adopted if every piece still fits — so a
+    // required-only job packs as densely as an auto-filled one (no needless extra sheet), and a
+    // job that genuinely needs N sheets is left untouched.
+    const repackInto=(designs,k,t0,budget)=>{
+      const ns=[], no=[];
+      for(let i=0;i<k;i++){ ns.push({surface:new Int32Array(W).fill(0),placements:[]}); no.push(new Uint8Array(W*occH)); }
+      const ord=designs.slice().sort((a,b)=>(b.wIn*b.hIn)-(a.wIn*a.hIn));
+      for(const d of ord){ if(Date.now()-t0>budget) return null;
+        const cand=fpTrue(d).filter(c=>pAng.includes(c.ang)); let placed=false;
+        for(let si=0; si<k; si++){ const spot=findSpot(no[si],cand); if(spot){ placeSpot(ns[si],no[si],d,spot); placed=true; break; } }
+        if(!placed) return null;
+      }
+      return ns;
+    };
+    if(pocket && sheets.length>1){
+      const tc=Date.now(), CB=1100; let cur=sheets;
+      while(cur.length>1 && Date.now()-tc<CB){
+        const all=[]; cur.forEach(s=>s.placements.forEach(p=>all.push(p.d)));
+        const attempt=repackInto(all, cur.length-1, tc, CB);
+        if(attempt) cur=attempt; else break;
+      }
+      sheets=cur;
+    }
+
     // auto-fill pass: fill leftover room on existing sheets, by PRIORITY ORDER —
     // pour in the 1st auto-fill design as much as it fits, then the next, and so on.
     const fillers=fill? S.designs.filter(d=>d.autofill) : [];
@@ -778,13 +867,25 @@ function nestAll(){
       if(sheets.length===0) newSheetIn(sheets);
       let guard=8000;
       for(const d of fillers){
-        const cand=fpsFor(d,usedTS); let placedAny=true;
+        const cand=fpsFor(d,usedAggr); let placedAny=true;
         while(placedAny && guard>0){
           placedAny=false;
-          for(const cs of sheets){ const res=pickBest(cand,cs.surface,usedTS,maxLenCells);
+          for(const cs of sheets){ const res=pickBest(cand,cs.surface,usedAggr>0,maxLenCells);
             if(res.b){ commit(res.b,res.ba,cs,d); placedAny=true; guard--; break; } }
         }
         if(guard<=0) break;
+      }
+    }
+    // 2D POCKET FILL — drop auto-fill copies into pockets the top-down skyline can't reach.
+    if(pocket && fillers.length){
+      const t0=Date.now(), BUDGET=900; const occ=sheets.map(buildOcc);
+      for(const d of fillers){
+        if(Date.now()-t0>BUDGET) break;
+        const cand=fpTrue(d).filter(c=>pAng.includes(c.ang));
+        let placedAny=true;
+        while(placedAny && Date.now()-t0<BUDGET){ placedAny=false;
+          for(let si=0; si<sheets.length; si++){ const spot=findSpot(occ[si],cand); if(spot){ placeSpot(sheets[si],occ[si],d,spot); placedAny=true; break; } }
+        }
       }
     }
     const total=sheets.reduce((a,s)=>a+s.placements.length,0);
@@ -803,6 +904,7 @@ function nestAll(){
     }
     chosen=best; usedGap=bestG;
   }
+  chosen=packFull(usedGap, true, capLen, true);   // final layout: add 2D pocket fill once
   S.effGapIn=usedGap;
   const {sheets, cpi, W}=chosen;
 
@@ -865,7 +967,7 @@ function spreadSheet(sh){
 
 /* run nesting with a non-blocking overlay */
 let _nestTimer=null;
-function scheduleNest(){ clearTimeout(_nestTimer); _nestTimer=setTimeout(runNest,180); }
+function scheduleNest(){ if(!S.autoNest){ updateStats(); updateList(); return; } clearTimeout(_nestTimer); _nestTimer=setTimeout(runNest,180); }
 function runNest(){
   if(!S.designs.length){ S.sheets=[]; renderPreview(); updateStats(); return; }
   const angles=buildAngles();
@@ -880,6 +982,7 @@ function runNest(){
   },20);
 }
 $('nestBtn').addEventListener('click',runNest);
+$('autoNestChk').addEventListener('change',e=>{ S.autoNest=e.target.checked; if(S.autoNest) runNest(); });
 
 /* ---------- preview (canvas per sheet) + manual editing ---------- */
 function fitAllScale(){
@@ -901,13 +1004,19 @@ function drawSheetCanvas(v){
   sh.placements.forEach((p,j)=>{
     const w=p.d.wIn*scale, h=p.d.hIn*scale;
     const cx=(p.xIn+p.d.wIn/2)*scale, cy=(p.yIn+p.d.hIn/2)*scale;
-    ctx.save(); ctx.translate(cx,cy); ctx.rotate(p.rot*Math.PI/180);
-    ctx.drawImage(p.d.img,-w/2,-h/2,w,h);
-    if(selD&&p.d.id===selD.id){ ctx.strokeStyle='rgba(255,138,61,.7)'; ctx.lineWidth=1.5; ctx.strokeRect(-w/2,-h/2,w,h); }
     const isSel=S.sel&&S.sel.sheet===v.index&&S.sel.idx===j;
-    if(isSel){ ctx.strokeStyle='#ff8a3d'; ctx.lineWidth=2.5; ctx.strokeRect(-w/2,-h/2,w,h); }
+    ctx.save(); ctx.translate(cx,cy); ctx.rotate(p.rot*Math.PI/180);
+    if(isSel){
+      // glow that follows the real artwork shape (no bounding box)
+      ctx.shadowColor='#ff8a3d'; ctx.shadowBlur=18;
+      ctx.drawImage(p.d.img,-w/2,-h/2,w,h);
+      ctx.drawImage(p.d.img,-w/2,-h/2,w,h);
+      ctx.shadowBlur=10; ctx.drawImage(p.d.img,-w/2,-h/2,w,h);
+      ctx.shadowBlur=0;
+    }
+    ctx.drawImage(p.d.img,-w/2,-h/2,w,h);
     ctx.restore();
-    if(isSel){ // rotate handle, drawn upright
+    if(isSel){ // rotate handle
       const hp=rotHandle(p,scale);
       ctx.strokeStyle='#ff8a3d'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(hp.x,hp.y); ctx.stroke();
       ctx.fillStyle='#ff8a3d'; ctx.beginPath(); ctx.arc(hp.x,hp.y,6,0,7); ctx.fill();
@@ -977,6 +1086,19 @@ function buildSheetLenControl(i){
 }
 function attachSheetEvents(v, scale){
   const cv=v.cv;
+  cv.addEventListener('dblclick', e=>{           // double-click empty space to drop a copy of the selected design here
+    const sc=dispScale(); const xIn=e.offsetX/sc, yIn=e.offsetY/sc;
+    if(hitTest(v.sh,xIn,yIn)>=0) return;         // double-clicked a piece, not empty space
+    if(S.selId==null){ toast('Pick a design in the list first, then double-click to add a copy'); return; }
+    const d=designById(S.selId); if(!d) return;
+    const nx=Math.max(0,Math.min(S.widthIn-d.wIn, xIn-d.wIn/2));
+    const ny=Math.max(0,Math.min(v.sh.lengthIn-d.hIn, yIn-d.hIn/2));
+    v.sh.placements.push({d, xIn:nx, yIn:ny, rot:0});
+    v.sh.pieces=v.sh.placements.length;
+    S.sel={sheet:v.index, idx:v.sh.placements.length-1};
+    sheetViews.forEach(drawSheetCanvas); updateStats();
+    toast('Copy added — drag to position');
+  });
   cv.addEventListener('pointerdown', e=>{
     const sc=dispScale();
     const xIn=e.offsetX/sc, yIn=e.offsetY/sc;
@@ -997,12 +1119,44 @@ function attachSheetEvents(v, scale){
     startMove(e,v,p);
   });
 }
+function ensureMask(d){             // build artwork mask, ignoring an edge-connected solid/transparent background
+  if(d._maskCanvas) return;
+  const maxDim=240, ar=(d.naturalH/d.naturalW)||1;
+  let w=maxDim, h=Math.round(maxDim*ar); if(h>maxDim){ h=maxDim; w=Math.round(maxDim/ar); }
+  w=Math.max(1,w); h=Math.max(1,h);
+  const cv=document.createElement('canvas'); cv.width=w; cv.height=h;
+  const ctx=cv.getContext('2d'); ctx.drawImage(d.img,0,0,w,h);
+  const px=ctx.getImageData(0,0,w,h).data;
+  const corners=[0, w-1, (h-1)*w, (h-1)*w+w-1];
+  let transparentBg=false, cr=0,cg=0,cb=0,cn=0;
+  corners.forEach(i=>{ if(px[i*4+3]<24) transparentBg=true; cr+=px[i*4];cg+=px[i*4+1];cb+=px[i*4+2];cn++; });
+  cr/=cn; cg/=cn; cb/=cn;
+  const isBg=(i)=>{ const a=px[i*4+3]; if(a<24) return true; if(transparentBg) return false;
+    const dr=px[i*4]-cr, dg=px[i*4+1]-cg, db=px[i*4+2]-cb; return (dr*dr+dg*dg+db*db) < 30*30; };
+  const out=new Uint8Array(w*h), stack=[];           // flood the background inward from the edges only
+  for(let x=0;x<w;x++){ stack.push(x,(h-1)*w+x); }
+  for(let y=0;y<h;y++){ stack.push(y*w, y*w+w-1); }
+  while(stack.length){ const i=stack.pop(); if(out[i]||!isBg(i)) continue; out[i]=1;
+    const x=i%w, y=(i/w)|0;
+    if(x>0)stack.push(i-1); if(x<w-1)stack.push(i+1); if(y>0)stack.push(i-w); if(y<h-1)stack.push(i+w); }
+  const art=new Uint8Array(w*h); for(let i=0;i<w*h;i++) art[i]=out[i]?0:1;
+  d._alpha={w,h,data:art};
+  const mc=document.createElement('canvas'); mc.width=w; mc.height=h;
+  const id=mc.getContext('2d').createImageData(w,h);
+  for(let i=0;i<w*h;i++) if(art[i]){ id.data[i*4+3]=255; }
+  mc.getContext('2d').putImageData(id,0,0); d._maskCanvas=mc;
+}
+function designAlpha(d){ ensureMask(d); return d._alpha; }
 function hitTest(sh,xIn,yIn){
   for(let j=sh.placements.length-1;j>=0;j--){
     const p=sh.placements[j], cx=p.xIn+p.d.wIn/2, cy=p.yIn+p.d.hIn/2, a=-p.rot*Math.PI/180;
     const dx=xIn-cx, dy=yIn-cy;
     const lx=dx*Math.cos(a)-dy*Math.sin(a), ly=dx*Math.sin(a)+dy*Math.cos(a);
-    if(Math.abs(lx)<=p.d.wIn/2 && Math.abs(ly)<=p.d.hIn/2) return j;
+    if(Math.abs(lx)>p.d.wIn/2 || Math.abs(ly)>p.d.hIn/2) continue;   // outside the box: not this one
+    const am=designAlpha(p.d);                                       // inside the box: only a hit on real artwork
+    let u=Math.floor((lx+p.d.wIn/2)/p.d.wIn*am.w), vv=Math.floor((ly+p.d.hIn/2)/p.d.hIn*am.h);
+    u=Math.max(0,Math.min(am.w-1,u)); vv=Math.max(0,Math.min(am.h-1,vv));
+    if(am.data[vv*am.w+u]) return j;
   }
   return -1;
 }
@@ -1033,9 +1187,21 @@ function startRotate(e,v,p){
   const up=()=>{ v.cv.removeEventListener('pointermove',move); v.cv.removeEventListener('pointerup',up); drawSheetCanvas(v); afterEdit(v); };
   v.cv.addEventListener('pointermove',move); v.cv.addEventListener('pointerup',up);
 }
+function edgeViolated(sh,idx){
+  const b=rotBBox(sh.placements[idx]);
+  return b.left < -0.001 || b.top < -0.001 || b.right > S.widthIn+0.001 || b.bottom > sh.lengthIn+0.001;
+}
 function afterEdit(v){
   if(!S.sel) return;
-  if(gapViolated(v.sh,S.sel.idx) && !S.warnGapOff) openGapWarn(v);
+  if(S.warnGapOff) return;
+  const offEdge = edgeViolated(v.sh,S.sel.idx);
+  const tooClose = gapViolated(v.sh,S.sel.idx);
+  if(offEdge || tooClose){
+    $('gapWarnText').textContent = offEdge
+      ? 'This piece now runs off the edge of the sheet — part of it would be cut off.'
+      : 'This piece is now closer than your set gap to another design. It may print without enough spacing.';
+    openGapWarn(v);
+  }
 }
 // true-shape gap check between the edited piece and the rest of its sheet
 function pieceCells(p,gcpi,dilateR){
@@ -1295,11 +1461,12 @@ async function idbDel(id){ const db=await idb(); return new Promise((res,rej)=>{
 
 function getControls(){ return {
   widthSel:$('widthSel').value, widthCustom:$('widthCustom').value, maxLen:$('maxLen').value, dpiSel:$('dpiSel').value, gapIn:$('gapIn').value,
-  optRotate:$('optRotate').checked, optInterlock:$('optInterlock').checked, optAutoGap:$('optAutoGap').checked, optStep:$('optStep').value, unit:S.unit }; }
+  optRotate:$('optRotate').checked, optInterlock:$('optInterlock').checked, optAutoGap:$('optAutoGap').checked, optStep:$('optStep').value, optAggr:$('optAggr').value, unit:S.unit }; }
 function setControls(c){ if(!c)return;
   S.unit = c.unit==='cm'?'cm':'in';
   $('widthSel').value=c.widthSel; $('widthCustom').value=c.widthCustom; $('maxLen').value=c.maxLen; $('dpiSel').value=c.dpiSel; $('gapIn').value=c.gapIn;
   $('optRotate').checked=c.optRotate!==false; $('optInterlock').checked=c.optInterlock!==false; $('optAutoGap').checked=c.optAutoGap!==false; $('optStep').value=c.optStep||'90';
+  if(c.optAggr!=null){ $('optAggr').value=c.optAggr; S.interlockAggr=(+c.optAggr)/100; } syncAggrUI();
   $('customWrap').style.display = c.widthSel==='custom'?'block':'none';
   $('rotStepWrap').style.display = $('optRotate').checked?'block':'none';
   setUnitLabels(); }
@@ -1405,6 +1572,15 @@ $('importJobInput').onchange=e=>{ const f=e.target.files[0]; if(!f)return; const
   rd.readAsText(f); e.target.value=''; };
 
 /* ---------- init ---------- */
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Delete' && e.key!=='Backspace') return;
+  const t=document.activeElement; if(t && /INPUT|SELECT|TEXTAREA/.test(t.tagName)) return;
+  if(!S.sel) return;
+  const sh=S.sheets[S.sel.sheet]; if(!sh) return;
+  sh.placements.splice(S.sel.idx,1); sh.pieces=sh.placements.length; S.sel=null;
+  sheetViews.forEach(drawSheetCanvas); updateStats();
+  e.preventDefault();
+});
 document.querySelectorAll('aside.rail .sect h2').forEach(h=>{
   h.addEventListener('click',e=>{ if(e.target.closest('.useg')) return; h.parentElement.classList.toggle('collapsed'); });
 });
