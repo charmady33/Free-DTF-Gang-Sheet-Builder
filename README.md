@@ -4,7 +4,7 @@ A free, browser-based tool for laying out **DTF (direct-to-film) gang sheets**. 
 
 No installation, no account, no internet required after the page loads. Everything runs locally in your browser, so your artwork never leaves your computer.
 
-**▶ Use it now:**https://clarkmccoy33.github.io/gangforge/**
+**▶ Use it now:**https://charmady33.github.io/Free-DTF-Gang-Sheet-Builder/**
 
 If GangForge saves you time, tips are appreciated: **https://www.paypal.com/paypalme/clarkmccoy33** 💛
 
