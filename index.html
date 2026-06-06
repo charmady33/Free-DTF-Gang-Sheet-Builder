@@ -763,12 +763,13 @@ function nestAll(){
         if(!best) continue; commit(best,bestAng,target,d); }
       return sheets; };
     const totLen=(sheets)=>{ let t=0; sheets.forEach(s=>{ let mb=0; for(let i=0;i<W;i++) if(s.surface[i]>mb) mb=s.surface[i]; t+=mb; }); return t; };
-    // required pass — best of true-shape vs rectangle
+    // required pass — use true-shape interlock ONLY when it strictly wins (fewer sheets, or
+    // same sheets and shorter). Otherwise fall back to rectangles, so interlock can never
+    // make the gang sheet longer than plain packing would.
     let sheets, usedTS=false;
     if(interlock){ const A=packMode(true), B=packMode(false);
-      if(A.length<B.length){ sheets=A; usedTS=true; }
-      else if(B.length<A.length){ sheets=B; usedTS=false; }
-      else if(totLen(A)<=totLen(B)){ sheets=A; usedTS=true; } else { sheets=B; usedTS=false; }
+      if(A.length<B.length || (A.length===B.length && totLen(A)<totLen(B))){ sheets=A; usedTS=true; }
+      else { sheets=B; usedTS=false; }
     } else { sheets=packMode(false); usedTS=false; }
     // auto-fill pass: fill leftover room on existing sheets, by PRIORITY ORDER —
     // pour in the 1st auto-fill design as much as it fits, then the next, and so on.
