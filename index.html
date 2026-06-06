@@ -695,22 +695,23 @@ function buildFootprint(d,angleDeg,cpi,trueShape,gapCells){
   const mask=dilateMask(core,bw,bh,gapCells);
   const top=new Int32Array(bw).fill(-1), bot=new Int32Array(bw).fill(-1);
   for(let x=0;x<bw;x++)for(let y=0;y<bh;y++){ if(mask[y*bw+x]){ if(top[x]<0)top[x]=y; bot[x]=y+1; } }
-  return {bw,bh,top,bot};
+  return {bw,bh,top,bot,pad};
 }
-function findPlacement(fps,surface,W,minLen,fitAware){
+function findPlacement(fps,surface,W,minLen,fitAware,cap){
   let best=null;
   for(const fp of fps){
-    if(fp.bw>W) continue;
-    const maxX=W-fp.bw;
-    for(let x=0;x<=maxX;x++){
+    const pad=fp.pad||0;
+    if(fp.bw-2*pad>W) continue;                 // only the ARTWORK must fit the roll; edge gap may hang off
+    const xmin=-pad, xmax=W-fp.bw+pad;
+    for(let x=xmin;x<=xmax;x++){
       let py=0;
-      for(let col=0;col<fp.bw;col++){ if(fp.top[col]<0)continue; const need=surface[x+col]-fp.top[col]; if(need>py)py=need; }
+      for(let col=0;col<fp.bw;col++){ if(fp.top[col]<0)continue; const gx=x+col; if(gx<0||gx>=W)continue; const need=surface[gx]-fp.top[col]; if(need>py)py=need; }
       const bottom=py+fp.bh;
+      if(cap && bottom>cap) continue;            // never return a spot that overruns the sheet length
       let score;
       if(fitAware){
-        // how snugly the piece nestles into the current surface: empty cells trapped beneath it
         let gap=0, cols=0;
-        for(let col=0;col<fp.bw;col++){ if(fp.top[col]<0)continue; cols++; gap += (py+fp.top[col]) - surface[x+col]; }
+        for(let col=0;col<fp.bw;col++){ if(fp.top[col]<0)continue; const gx=x+col; if(gx<0||gx>=W)continue; cols++; gap += (py+fp.top[col]) - surface[gx]; }
         const avgGap = cols? gap/cols : 0;
         score = bottom + 0.7*avgGap;          // mostly minimize height, but reward a tight fit
       } else {
@@ -745,20 +746,20 @@ function nestAll(){
     const ROT_EPS=Math.max(2, Math.round(0.25*cpi));
     const fpsFor=(d,ts)=>{ const k=d.id+'|'+ts+'|'+cpi+'|'+gapCells; let v=fpCache.get(k); if(v)return v;
       v=angleList.map(ang=>({ang,fp:buildFootprint(d,ang,cpi,ts,gapCells)})); fpCache.set(k,v); return v; };
-    const pickBest=(cand,surface,ts)=>{ let b=null,ba=0,bm=Infinity;
-      for(const {ang,fp} of cand){ const r=findPlacement([fp],surface,W,minLen,ts); if(!r) continue;
+    const pickBest=(cand,surface,ts,cap)=>{ let b=null,ba=0,bm=Infinity;
+      for(const {ang,fp} of cand){ const r=findPlacement([fp],surface,W,minLen,ts,cap); if(!r) continue;
         let m = ts ? r.score : (minLen?r.bottom:r.py);
         if(!ts && ang!==0) m+=ROT_EPS;        // keep upright bias only when NOT interlocking
         if(m<bm){ bm=m; b=r; ba=ang; } } return {b,ba}; };
     const commit=(best,ang,sheet,d)=>{ const {fp,py,x}=best;
-      for(let col=0;col<fp.bw;col++){ if(fp.bot[col]<0)continue; const nb=py+fp.bot[col]; if(nb>sheet.surface[x+col]) sheet.surface[x+col]=nb; }
+      for(let col=0;col<fp.bw;col++){ if(fp.bot[col]<0)continue; const gx=x+col; if(gx<0||gx>=W)continue; const nb=py+fp.bot[col]; if(nb>sheet.surface[gx]) sheet.surface[gx]=nb; }
       const cxIn=(x+fp.bw/2)/cpi, cyIn=(py+fp.bh/2)/cpi;
       sheet.placements.push({d, xIn:cxIn-d.wIn/2, yIn:cyIn-d.hIn/2, rot:ang}); };
     const newSheetIn=(arr)=>{ const s={surface:new Int32Array(W).fill(0),placements:[]}; arr.push(s); return s; };
     const packMode=(ts)=>{ const sheets=[];
       for(const d of inst){ const cand=fpsFor(d,ts); let best=null,bestAng=0,target=null;
-        for(const cs of sheets){ const res=pickBest(cand,cs.surface,ts); if(res.b&&res.b.bottom<=maxLenCells){best=res.b;bestAng=res.ba;target=cs;break;} }
-        if(!target){ target=newSheetIn(sheets); const res=pickBest(cand,target.surface,ts); best=res.b; bestAng=res.ba; }
+        for(const cs of sheets){ const res=pickBest(cand,cs.surface,ts,maxLenCells); if(res.b){best=res.b;bestAng=res.ba;target=cs;break;} }
+        if(!target){ target=newSheetIn(sheets); const res=pickBest(cand,target.surface,ts,Infinity); best=res.b; bestAng=res.ba; }  // fresh sheet: place even if taller than max
         if(!best) continue; commit(best,bestAng,target,d); }
       return sheets; };
     const totLen=(sheets)=>{ let t=0; sheets.forEach(s=>{ let mb=0; for(let i=0;i<W;i++) if(s.surface[i]>mb) mb=s.surface[i]; t+=mb; }); return t; };
@@ -769,15 +770,20 @@ function nestAll(){
       else if(B.length<A.length){ sheets=B; usedTS=false; }
       else if(totLen(A)<=totLen(B)){ sheets=A; usedTS=true; } else { sheets=B; usedTS=false; }
     } else { sheets=packMode(false); usedTS=false; }
-    // auto-fill pass (so the total image count reflects the FULL sheet)
+    // auto-fill pass: fill leftover room on existing sheets, by PRIORITY ORDER —
+    // pour in the 1st auto-fill design as much as it fits, then the next, and so on.
     const fillers=fill? S.designs.filter(d=>d.autofill) : [];
     if(fillers.length){
       if(sheets.length===0) newSheetIn(sheets);
-      let active=fillers.slice(), guard=8000, progressed=true;
-      while(active.length && guard>0 && progressed){ progressed=false;
-        for(let i=0;i<active.length;i++){ const d=active[i], cand=fpsFor(d,usedTS); let placed=false;
-          for(const cs of sheets){ const res=pickBest(cand,cs.surface,usedTS); if(res.b&&res.b.bottom<=maxLenCells){ commit(res.b,res.ba,cs,d); placed=true; progressed=true; guard--; break; } }
-          if(!placed){ active.splice(i,1); i--; } if(guard<=0) break; }
+      let guard=8000;
+      for(const d of fillers){
+        const cand=fpsFor(d,usedTS); let placedAny=true;
+        while(placedAny && guard>0){
+          placedAny=false;
+          for(const cs of sheets){ const res=pickBest(cand,cs.surface,usedTS,maxLenCells);
+            if(res.b){ commit(res.b,res.ba,cs,d); placedAny=true; guard--; break; } }
+        }
+        if(guard<=0) break;
       }
     }
     const total=sheets.reduce((a,s)=>a+s.placements.length,0);
